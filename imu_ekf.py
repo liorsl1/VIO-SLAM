@@ -54,6 +54,11 @@ class IMUEKF:
         self.accel_noise_density = 2.0000e-3    # m/s²/√Hz
         self.accel_random_walk = 3.0000e-3      # m/s³/√Hz
         self.R_align = None
+    #     self.R_align = np.array([
+    #     [0, 0, 1],  # New X-axis = Old Z-axis
+    #     [0, 1, 0],  # Y remains unchanged
+    #     [1, 0, 0]  # New Z-axis = Old X-axis
+    # ])
         
         # Process and measurement noise - will be set during predict()
         self.Q = np.zeros((self.n, self.n))
@@ -75,6 +80,127 @@ class IMUEKF:
             self.x[10:13] = accel_bias
         if gyro_bias is not None:
             self.x[13:16] = gyro_bias
+
+    def to_rotation(self, q):
+        """
+        Convert a quaternion to the corresponding rotation matrix.
+        Pay attention to the convention used. The function follows the
+        conversion in "Indirect Kalman Filter for 3D Attitude Estimation:
+        A Tutorial for Quaternion Algebra", Equation (78).
+        The input quaternion should be in the form [q1, q2, q3, q4(scalar)]
+        """
+        q = q / np.linalg.norm(q)
+        vec = q[:3]
+        w = q[3]
+
+        R = (2*w*w-1)*np.identity(3) - 2*w*skew(vec) + 2*vec[:, None]*vec
+        return R
+
+    def predict2(self, a_m, w_m, timestamp):
+        if self.last_time is None:
+            self.last_time = timestamp
+            return
+        
+         # Extract state
+        p = self.x[0:3]
+        v = self.x[3:6]
+        q = self.x[6:10]  # [x, y, z, w] for scipy
+        ba = self.x[10:13]
+        bg = self.x[13:16]
+
+        # Bias-corrected measurements
+        # Transform measurements to body frame first:
+        acc = a_m - ba
+        gyro = w_m - bg
+        
+        dt = timestamp - self.last_time
+        self.last_time = timestamp
+
+        gyro_norm = np.linalg.norm(gyro)
+        Omega = np.zeros((4, 4))
+        Omega[:3, :3] = -skew(gyro)
+        Omega[:3, 3] = gyro
+        Omega[3, :3] = -gyro
+
+        if gyro_norm > 1e-5:
+            dq_dt = (np.cos(gyro_norm*dt*0.5) * np.identity(4) + 
+                np.sin(gyro_norm*dt*0.5)/gyro_norm * Omega) @ q
+            dq_dt2 = (np.cos(gyro_norm*dt*0.25) * np.identity(4) + 
+                np.sin(gyro_norm*dt*0.25)/gyro_norm * Omega) @ q
+        else:
+            dq_dt = np.cos(gyro_norm*dt*0.5) * (np.identity(4) + 
+                Omega*dt*0.5) @ q
+            dq_dt2 = np.cos(gyro_norm*dt*0.25) * (np.identity(4) + 
+                Omega*dt*0.25) @ q
+
+        dR_dt_transpose = self.to_rotation(dq_dt).T
+        dR_dt2_transpose = self.to_rotation(dq_dt2).T
+
+        Rwb = self.to_rotation(q).T  # Rotation matrix from body to world
+        # k1 = f(tn, yn)
+        k1_p_dot = v
+        k1_v_dot = Rwb @ acc + self.g
+
+        # k2 = f(tn+dt/2, yn+k1*dt/2)
+        k1_v = v + k1_v_dot*dt/2.
+        k2_p_dot = k1_v
+        k2_v_dot = dR_dt2_transpose @ acc + self.g
+        
+        # k3 = f(tn+dt/2, yn+k2*dt/2)
+        k2_v = v + k2_v_dot*dt/2
+        k3_p_dot = k2_v
+        k3_v_dot = dR_dt2_transpose @ acc + self.g
+        
+        # k4 = f(tn+dt, yn+k3*dt)
+        k3_v = v + k3_v_dot*dt
+        k4_p_dot = k3_v
+        k4_v_dot = dR_dt_transpose @ acc + self.g
+
+        # yn+1 = yn + dt/6*(k1+2*k2+2*k3+k4)
+        q = dq_dt / np.linalg.norm(dq_dt)
+        v = v + (k1_v_dot + 2*k2_v_dot + 2*k3_v_dot + k4_v_dot)*dt/6.
+        p = p + (k1_p_dot + 2*k2_p_dot + 2*k3_p_dot + k4_p_dot)*dt/6.
+
+         # Update state
+        self.x[0:3] = p
+        self.x[3:6] = v
+        self.x[6:10] = q
+
+        # --- CORRECTED COVARIANCE PROPAGATION ---
+        # Build the full state transition matrix (Jacobian F)
+        F = np.eye(self.n)
+        F[0:3, 3:6] = np.eye(3) * dt  # d(pos)/d(vel)
+        
+        # d(vel)/d(ori) = -Rwb * skew(acc) * dt
+        F[3:6, 6:9] = -Rwb @ skew(acc) * dt
+        
+        # d(vel)/d(acc_bias) = -Rwb * dt
+        F[3:6, 10:13] = -Rwb * dt
+        
+        # d(ori)/d(gyro_bias) = -Rwb * dt (in tangent space)
+        F[6:9, 13:16] = -Rwb * dt
+        F[6:9, 3:6] = -0.5 * Rwb * dt  # d(θ)/d(v)
+        # Build process noise covariance Q
+        Q = np.zeros((12, 12))
+        Q[0:3, 0:3] = np.eye(3) * self.accel_noise_density**2
+        Q[3:6, 3:6] = np.eye(3) * self.gyro_noise_density**2
+        Q[6:9, 6:9] = np.eye(3) * self.accel_random_walk**2
+        Q[9:12, 9:12] = np.eye(3) * self.gyro_random_walk**2
+        
+        # Map noise to state space
+        G = np.zeros((self.n, 12))
+        G[3:6, 0:3] = -Rwb
+        G[6:9, 3:6] = -Rwb
+        G[10:13, 6:9] = np.eye(3)
+        G[13:16, 9:12] = np.eye(3)
+        
+        Q_discrete = G @ Q @ G.T * dt
+
+        # Propagate covariance
+        self.P = F @ self.P @ F.T + Q_discrete
+        #self.P *= inflation_factor  # Apply inflation
+
+
 
     def predict(self, a_m, w_m, timestamp):
         if self.last_time is None:
@@ -98,13 +224,18 @@ class IMUEKF:
         # Transform measurements to body frame first:
         acc = a_m - ba
         omega = w_m - bg
-        # acc = self.R_align @ acc  # Transform to world frame
-        # omega = self.R_align @ omega  # Transform to world frame
-
+        #acc = self.R_align @ acc  # Transform to world frame
+        #omega = self.R_align @ omega  # Transform to world frame
+        #R_align = np.diag([-1, 1, 1])  # Example: flip Y and Z
+        #acc = R_align @ acc
+        # omega = R_align @ omega
         # Rotation matrix from body to world
+        #q[2] = -q[2]  # Invert z component for yaw correction
         Rwb = R.from_quat(q).as_matrix()
+        #Rwb2 = self.to_rotation(q)  # Convert quaternion to rotation matrix
+        #Rwb = Rwb.T  # Transpose to get body to world rotation
         a_world = Rwb @ acc - self.g
-
+        #a_world[2] = -a_world[2]  # Ensure gravity is in the negative Z direction
         # Integrate position and velocity
         p += v * dt + 0.5 * a_world * dt**2
         v += a_world * dt
@@ -135,7 +266,7 @@ class IMUEKF:
         
         # d(ori)/d(gyro_bias) = -Rwb * dt (in tangent space)
         F[6:9, 13:16] = -Rwb * dt
-
+        F[6:9, 3:6] = -0.5 * Rwb * dt  # d(θ)/d(v)
         # Build process noise covariance Q
         Q = np.zeros((12, 12))
         Q[0:3, 0:3] = np.eye(3) * self.accel_noise_density**2
@@ -203,97 +334,86 @@ class IMUEKF:
         
         # Update state vector
         self.x = self.x + (K @ y).flatten()
+        self.x[6:10] /= np.linalg.norm(self.x[6:10])
         
         # Update covariance matrix
         I = np.eye(16)
         self.P = (I - K @ H) @ self.P
         
 
-    def update_with_vslam(self, pos_meas, quat_meas, R_pos, R_quat):
-        # --- Position update ---
+    def update_with_vslam(self, pos_meas_world, quat_meas_world, R_pos, R_quat):
+        """
+        Update with visual pose already transformed to IMU body frame.
+        Args:
+            pos_meas_body: Position measurement in IMU body frame (3D)
+            quat_meas_body: Orientation measurement in IMU body frame (quaternion [x,y,z,w])
+            R_pos: Position measurement noise covariance (3x3)
+            R_quat: Orientation measurement noise covariance (3x3)
+        """
+        # --- Position Update ---
+        # Transform body-frame position to world frame using current state
+        q_est = self.x[6:10]  # Current estimate: q_world_from_body
+        R_est = R.from_quat(q_est).as_matrix()
+
         H_pos = np.zeros((3, 16))
         H_pos[:, 0:3] = np.eye(3)
-        
-        pos_meas = np.array(pos_meas).flatten()[:3]
-        y_pos = pos_meas - self.x[0:3]
-        
-        # Calculate innovation covariance for position
+        y_pos = pos_meas_world - self.x[0:3]  # Innovation
+
+        # Chi-square test and update (unchanged)
         S_pos = H_pos @ self.P @ H_pos.T + R_pos
-        
-        # Chi-square test for position innovation
         NIS_pos = float(y_pos.T @ np.linalg.inv(S_pos) @ y_pos)
-        print(f"Position NIS: {NIS_pos:.2f} (should be ~3.0)")
-        
-        # Check if update is reasonable before applying
-        if NIS_pos > 10:  # 99% confidence threshold for 3 DOF
-            print(f"WARNING: Large position innovation ({NIS_pos:.2f}), possible outlier!")
-            # Increase measurement noise to trust this update less
+        if NIS_pos > 10:
             R_pos_adjusted = R_pos * (NIS_pos / 3.0)
-            self._kalman_update(y_pos, H_pos, R_pos_adjusted)
-        else:
-            self._kalman_update(y_pos, H_pos, R_pos)
+        self._kalman_update(y_pos, H_pos, R_pos_adjusted if NIS_pos > 10 else R_pos)
 
-        # --- Orientation update ---
-        # Similar approach for orientation with chi-square test
-        q_est = self.x[6:10]
-        q_meas = np.array(quat_meas).flatten()[:4]  # Ensure it's 4D
-        q_meas = q_meas / np.linalg.norm(q_meas)  # Normalize
+        # --- Orientation Update ---
+        # Current orientation estimate: q_world_from_body
+        q_meas_world_from_body = np.array(quat_meas_world) / np.linalg.norm(quat_meas_world)
 
-        # Convert quaternions to rotation matrices and compute error
-        R_est = R.from_quat(q_est)
-        R_meas = R.from_quat(q_meas)
-        rotvec_error = (R_meas * R_est.inv()).as_rotvec()
+        # Error is q_meas * q_est^-1 (rotation from estimate to measurement)
+        q_error = R.from_quat(q_meas_world_from_body) * R.from_quat(q_est).inv()
+        rotvec_error = q_error.as_rotvec()  # Small-angle approximation
 
         H_ori = np.zeros((3, 16))
-        H_ori[:, 6:9] = np.eye(3)  # Small-angle approximation
+        H_ori[:, 6:9] = np.eye(3)
         
-        # Calculate innovation covariance for orientation
+        # Chi-square test and update
         S_ori = H_ori @ self.P @ H_ori.T + R_quat
-        
-        # Chi-square test for orientation innovation
         NIS_ori = float(rotvec_error.T @ np.linalg.inv(S_ori) @ rotvec_error)
-        print(f"Orientation NIS: {NIS_ori:.2f}")
-        
-        # Check if update is reasonable before applying
-        if NIS_ori > 20:  # 99% confidence threshold for 3 DOF
-            print(f"WARNING: Large orientation innovation ({NIS_ori:.2f}), possible outlier!")
-            # Increase measurement noise to trust this update less
+        if NIS_ori > 20:
             R_quat_adjusted = R_quat * (NIS_ori / 3.0)
-            self._kalman_update(rotvec_error, H_ori, R_quat_adjusted)
-        else:
-            self._kalman_update(rotvec_error, H_ori, R_quat)
+        self._kalman_update(-rotvec_error, H_ori, R_quat_adjusted if NIS_ori > 20 else R_quat)
 
 
-    def update_with_vslam_relative_pose(self, R_rel, t_rel, R_uncertainty=None, t_uncertainty=None):
-        """Update EKF with relative pose from visual SLAM"""
+    def update_with_vslam_relative_pose(self, R_rel_body, t_rel_body, R_uncertainty=None, t_uncertainty=None):
+        """
+        Corrected relative pose update
+        Args:
+            R_rel_body: Rotation from body at t1 to body at t2 (3x3 matrix)
+            t_rel_body: Translation from body at t1 to body at t2 (in t1's body frame)
+        """
         if R_uncertainty is None:
-            R_uncertainty = np.eye(3) * 0.01
+            R_uncertainty = np.eye(3) * 0.1
         if t_uncertainty is None:
-            t_uncertainty = np.eye(3) * 0.01
-        
-        # Ensure correct dimensions
-        R_rel = np.array(R_rel).reshape(3, 3)
-        t_rel = np.array(t_rel).flatten()[:3]  # Ensure it's 3D
-        
-        # Extract current state
-        p_curr = self.x[0:3]
-        q_curr = self.x[6:10]  # quaternion [x,y,z,w]
-        
-        # Convert current quaternion to rotation matrix
-        R_curr = R.from_quat(q_curr).as_matrix()
-        
-        # Compute absolute position from relative translation
-        t_world = R_curr @ t_rel.reshape(3, 1)
-        p_meas = p_curr + t_world.flatten()
-        
-        # Compute absolute orientation from relative rotation
-        R_meas = R_curr @ R_rel
-        q_meas = R.from_matrix(R_meas).as_quat()  # [x,y,z,w]
-        
-        # Update with absolute measurements
-        self.update_with_vslam(p_meas, q_meas, t_uncertainty, R_uncertainty)
+            t_uncertainty = np.eye(3) * 0.5  # Typically higher than rotation uncertainty
 
-    
+        # Current state
+        p_curr = self.x[0:3]
+        q_curr = self.x[6:10]
+        R_curr = R.from_quat(q_curr).as_matrix()
+
+        # Transform relative pose to world frame
+        t_world = R_curr @ t_rel_body  # Body->world rotation at t1
+        R_world = R_curr @ R_rel_body  # Correct composition
+
+        # Compute absolute measurement
+        pos_meas_world = p_curr + t_world
+        q_meas_world_from_body = R.from_matrix(R_world).as_quat()
+        #q_meas_body = R.from_matrix(R_rel_body).as_quat()
+
+        # Update with absolute measurements
+        self.update_with_vslam(pos_meas_world, q_meas_world_from_body, t_uncertainty, R_uncertainty)
+
     def debug_uncertainty(self):
         """Print uncertainty (standard deviation) for each state variable"""
         std_devs = np.sqrt(np.diag(self.P))

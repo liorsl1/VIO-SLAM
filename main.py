@@ -1,4 +1,4 @@
-from imu_utils import align_ground_truth_to_z_gravity_frame, create_gravity_aligned_coordinate_system, transform_imu_to_z_gravity_frame, transform_vicon_to_body_frame
+from imu_utils import align_ground_truth_to_gravity_world, align_ground_truth_to_z_gravity_frame, create_gravity_aligned_coordinate_system, transform_imu_to_z_gravity_frame, transform_vicon_to_body_frame
 from rel_pose_vis import RelativePoseVisualizer
 from vslam import *
 from factor_graph_vio import VIFusionGraphISAM2
@@ -56,8 +56,8 @@ def main():
     )
     # The EKF's physics model now operates in the ideal world frame
     imu_ekf.g = world_gravity_vec
-    imu_ekf.R_align = data_manager.R_align_IMU_to_gravity  # Set the alignment rotation matrix
-
+    #imu_ekf.R_align = data_manager.R_align_IMU_to_gravity  # Set the alignment rotation matrix
+    # --- Factor Graph Initialization ---
     fg_vio = VIFusionGraphISAM2(
         initial_pose=np.concatenate([initial_pos, initial_ori_quat]), # Use gravity-aligned orientation
         initial_vel=initial_vel,
@@ -79,8 +79,8 @@ def main():
     vslam.trajectory = [np.eye(4)]  # Initialize trajectory as identity matrix
     vslam.trajectory[0][:3, 3] = initial_pos  # Set initial position
     py_vis = RealTimeSLAMPyVistaVisualizer()
-    R_uncertainty_ekf = np.eye(3) * 0.05
-    t_uncertainty_ekf = np.eye(3) * 0.02
+    R_uncertainty_ekf = np.eye(3) * 0.5
+    t_uncertainty_ekf = np.eye(3) * 0.2
     R_uncertainty = np.ones(3) * 0.05
     t_uncertainty = np.ones(3) * 0.05
 
@@ -91,10 +91,14 @@ def main():
     vis_trajectories = []
     synced_gt_poses = []
     step = 20
-
+    R_flipx = np.array([[1, 0, 0],
+                        [0, 1, 0],
+                        [0, 0, 1]])  # Flip X and Y axes to align with gravity world frame
+    
     # --- Main Loop ---
     # The rest of your main loop can remain largely the same.
     for idx, (row, left_img, right_img) in enumerate(data_manager.iter_stereo_frames(step=step)):
+        # trajectory_fg = []
         current_cam_timestamp = row["timestamp"]
 
         # Undistort images
@@ -154,19 +158,19 @@ def main():
             rel_pose = np.concatenate([rotvec, t_rel])
 
             before_update_P = imu_ekf.P.copy()
-            imu_ekf.update_with_vslam_relative_pose(R_rel, t_rel, R_uncertainty_ekf, t_uncertainty_ekf)
+            #imu_ekf.update_with_vslam_relative_pose(R_rel, t_rel, R_uncertainty_ekf, t_uncertainty_ekf)
             imu_ekf.measure_update_impact(before_update_P, imu_ekf.P)
             ekf_pose = imu_ekf.get_pose()
             ekf_position = ekf_pose['position']
-            trajectory_ekf.append(ekf_position)
+            trajectory_ekf.append(np.copy(ekf_position))
 
             # Factor graph visual update (periodically)
-            if (idx %  (2)) == 0 and idx >= 5:
+            if (idx %  (2)) == 0 and idx >= 4:
                 try:
                     fg_vio.add_new_state()
                     pose_uncertainty = np.concatenate([R_uncertainty[:3], t_uncertainty[:3]])
-                    fg_vio.add_visual_measurement(rel_pose, 200)
-                    fg_vio.debug_graph()
+                    #fg_vio.add_visual_measurement([R_rel, t_rel], 200)
+                    # fg_vio.debug_graph()
                     positions, orientations = fg_vio.get_full_trajectory()
                     if len(positions) > 0:
                         trajectory_fg = positions
@@ -178,7 +182,9 @@ def main():
         
         # Get the synced and transformed ground truth pose for this timestamp
         gt_pos, gt_quat = data_manager.get_synced_gt_poses(row["timestamp"])
+
         if gt_pos is not None:
+            # Align the GT pose to the gravity world frame
             synced_gt_poses.append(gt_pos)
 
         ekf_traj = np.array(trajectory_ekf) if trajectory_ekf else None

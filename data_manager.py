@@ -1,7 +1,9 @@
 import cv2
 import numpy as np
 import pandas as pd
-from imu_utils import from_two_vectors, align_ground_truth_to_gravity_world
+from imu_utils import from_two_vectors2,from_two_vectors, align_ground_truth_to_gravity_world, from_two_vectors3
+from scipy.spatial.transform import Rotation as R
+
 import os
 
 class DataManager:
@@ -36,7 +38,7 @@ class DataManager:
     def load_data(self):
         cam_path = os.path.join(self.data_dir, "cam0/data.csv")
         imu_path = os.path.join(self.data_dir, "imu0/data.csv")
-        gt_path = os.path.join(self.data_dir, "state_groundtruth_estimate0/data.csv")
+        gt_path = os.path.join(self.data_dir, "state_groundtruth_estimate0/dataset_better.csv")
         
         self.cam_df = pd.read_csv(cam_path)
         self.imu_df = pd.read_csv(imu_path)
@@ -98,6 +100,7 @@ class DataManager:
         # 2. Measure gravity vector in the IMU's local frame
         gravity_imu_frame = accel_data.mean(axis=0)
         gravity_norm = np.linalg.norm(gravity_imu_frame)
+        gravity_imu_frame /= gravity_norm  # Normalize to unit vector
         print(f"Measured gravity vector in IMU frame: {gravity_imu_frame} (Magnitude: {gravity_norm:.2f})")
         print(f"Estimated gyroscope bias: {bias_gyro}")
 
@@ -106,7 +109,9 @@ class DataManager:
 
         # 4. Calculate the initial orientation that aligns the IMU frame with the world frame
         # We want to find the rotation that maps the measured gravity to the ideal gravity.
-        initial_orientation_quat = from_two_vectors(gravity_imu_frame, world_gravity_vec)
+        initial_orientation_quat = from_two_vectors3(gravity_imu_frame, world_gravity_vec)
+        # Verify
+ 
         #world_gravity_vec[2] = -world_gravity_vec[2]  # Ensure gravity is the opposite
         return true_bias_accel, bias_gyro, initial_orientation_quat, world_gravity_vec
 
@@ -121,7 +126,7 @@ class DataManager:
         _, _, initial_gt_quat = self.get_initial_state_from_gt()
 
         # Get the initial orientation from gravity alignment (Gravity World -> Body)
-        _, _, initial_gravity_quat, _ = self.calculate_initial_biases_and_gravity(static_duration_sec=0.1) # Use short duration
+        _, _, initial_gravity_quat, _ = self.calculate_initial_biases_and_gravity(static_duration_sec=2) # Use short duration
 
         # Convert to rotation objects
         #r_vicon_to_body = R.from_quat(initial_gt_quat)
@@ -130,6 +135,7 @@ class DataManager:
         # We want R_gravity_to_vicon.
         # R_gravity_to_vicon = R_gravity_to_body * inv(R_vicon_to_body)
         self.R_align_IMU_to_gravity = (r_body_to_gravity).as_matrix()
+        #self.R_align_IMU_to_gravity = self.R_align_IMU_to_gravity.T  # Transpose to get the correct alignment
         print("Computed IMU-to-Gravity alignment rotation.")
 
     def get_synced_gt_poses(self, timestamp):

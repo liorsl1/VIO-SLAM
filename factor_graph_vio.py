@@ -23,7 +23,7 @@ class VIFusionGraphISAM2:
         self.add_initial_factors(initial_pose, initial_vel)
 
     def create_imu_params(self):
-        imu_params = gtsam.PreintegrationParams.MakeSharedU(-9.81)
+        imu_params = gtsam.PreintegrationParams.MakeSharedU(-9.8)
         if self.gravity_vector is not None:
             imu_params.n_gravity = [0,0,0]
         
@@ -75,17 +75,17 @@ class VIFusionGraphISAM2:
         dt = timestamp - self.prev_timestamp
         self.prev_timestamp = timestamp
         # Define the transformation from the IMU-centric graph frame to the gravity-aligned world frame
-        T_world_from_imu = gtsam.Pose3() # Default to identity
-        if self.gravity_vector is not None:
-            accel_world = self.R_align @ accel
-            gyro_world = self.R_align @ gyro
+        # T_world_from_imu = gtsam.Pose3() # Default to identity
+        # if self.gravity_vector is not None:
+        #     accel_world = self.R_align @ accel
+        #     gyro_world = self.R_align @ gyro
 
         if dt <= 0 or dt > 1.0:
             return
         self.imu_preintegrated.integrateMeasurement(accel, gyro, dt)
 
     def add_new_state(self):
-        if self.current_state_idx >= 20:  # Prevent unbounded growth
+        if self.current_state_idx >= 10:  # Prevent unbounded growth
             self.isam.update()
             self.graph.resize(0)
             self.current_state_idx = 0
@@ -116,7 +116,7 @@ class VIFusionGraphISAM2:
             self.graph.add(gtsam.ImuFactor(X(i), V(i), X(j), V(j), B(i), self.imu_preintegrated))
             
             # Add bias evolution factor with higher uncertainty
-            bias_noise = gtsam.noiseModel.Diagonal.Sigmas(np.ones(6) * 0.1)
+            bias_noise = gtsam.noiseModel.Diagonal.Sigmas(np.ones(6) * 0.01)
             self.graph.add(gtsam.BetweenFactorConstantBias(B(i), B(j), gtsam.imuBias.ConstantBias(), bias_noise))
 
             # Add initial estimates
@@ -137,20 +137,54 @@ class VIFusionGraphISAM2:
             print(f"Error in add_new_state: {e}")
             return False
 
-    def add_visual_measurement(self, rel_pose_world, num_matches):
+    def add_visual_measurement(self, rel_pose_imu, num_matches):
         if self.current_state_idx < 1:
             return False
+        
+        scale = 1
+        # Align visual scale with IMU in first few frames
 
         try:
+
             # Convert world-frame relative pose to IMU frame
             current_estimate = self.isam.calculateEstimate()
             T_prev_imu = current_estimate.atPose3(X(self.current_state_idx-1))
+            R_imu_to_world = current_estimate.atPose3(X(self.current_state_idx-1)).rotation()
+            # 3. Create world-frame relative pose
+            T_rel_imu = gtsam.Pose3(gtsam.Rot3(rel_pose_imu[0]),
+            gtsam.Point3(rel_pose_imu[1]))
+            # R_rel_world = R_imu_to_world * rel_pose_world[:3,:3] * R_imu_to_world.transpose()
+            # t_rel_world = R_imu_to_world * rel_pose_world[:3,3]
+            R_rel_imu = T_rel_imu.rotation()   # gtsam::Rot3
+            t_rel_imu = T_rel_imu.translation() # gtsam::Point3
+
+            # 2. Transform to world frame
+            R_rel_world = R_imu_to_world * R_rel_imu
+            t_rel_world = R_imu_to_world.rotate(t_rel_imu)
+            # Check if gravity vector matches expected
+
+            T_rel_world = gtsam.Pose3(R_rel_world, t_rel_world)
+            if self.current_state_idx < 2:
+                imu_disp = current_estimate.atPose3(X(self.current_state_idx)).translation() - current_estimate.atPose3(X(self.current_state_idx-1)).translation()
+                vo_disp = np.linalg.norm(t_rel_world)
+                scale = np.linalg.norm(imu_disp) / vo_disp
             
-            # Create relative pose in GTSAM format
-            rel_pose_gtsam = gtsam.Pose3(
-                gtsam.Rot3.Rodrigues(rel_pose_world[:3]),
-                gtsam.Point3(*rel_pose_world[3:])
+            t_rel_world *= scale
+
+            # Create noise model
+            trans_noise = 0.00001
+            rot_noise = 0.005
+            noise = gtsam.noiseModel.Diagonal.Sigmas(
+                np.array([trans_noise]*3 + [rot_noise]*3)
             )
+
+            # Create relative pose in GTSAM format
+            self.graph.add(gtsam.BetweenFactorPose3(
+            X(self.current_state_idx-1),
+            X(self.current_state_idx),
+            gtsam.Pose3(R_rel_world, gtsam.Point3(t_rel_world)),
+            noise
+        ))
             
             # Transform to IMU frame
             #rel_pose_imu = T_prev_imu.between(rel_pose_gtsam)
@@ -158,19 +192,13 @@ class VIFusionGraphISAM2:
             # Adaptive noise based on match quality
             # uncertainty = 0.1 / max(num_matches, 1)
             # noise = gtsam.noiseModel.Isotropic.Sigma(6, uncertainty)
-            # Adaptive noise
-            trans_noise = 0.001
-            rot_noise = 0.0005
-            noise = gtsam.noiseModel.Diagonal.Sigmas(
-                np.array([trans_noise]*3 + [rot_noise]*3)
-            )
             
-            self.graph.add(gtsam.BetweenFactorPose3(
-                X(self.current_state_idx-1),
-                X(self.current_state_idx),
-                rel_pose_gtsam,
-                noise
-            ))
+            # Add robust kernel to visual factors
+            # huber_loss = gtsam.noiseModel.Robust.Create(
+            #     gtsam.noiseModel.mEstimator.Huber.Create(1.0),
+            #     noise
+            # )
+            # self.graph.add(gtsam.BetweenFactorPose3(..., huber_loss))
             
             # Update ISAM2
             self.isam.update(self.graph, gtsam.Values())
@@ -200,6 +228,7 @@ class VIFusionGraphISAM2:
 
                     positions.append([pos_world[0], pos_world[1], pos_world[2]])
                     orientations.append([quat_world.x(), quat_world.y(), quat_world.z(), quat_world.w()])
+                    #print(positions)
             
             return np.array(positions), np.array(orientations)
             

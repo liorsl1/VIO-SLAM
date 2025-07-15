@@ -615,7 +615,7 @@ class vSLAM:
         T_abs_world = self.trajectory[-1] @ T_rel_world
         self.trajectory.append(T_abs_world)
         # 4. Return the relative motion in the gravity-aligned world frame
-        return T_abs_world, T_rel_world
+        return T_abs_world, T_rel_imu
     
     
     def calculate_scale_from_stereo(self, kp1, kp2, matches, depth_map=None):
